@@ -1,0 +1,961 @@
+#include "LPC17xx.h"
+#include <stdio.h>
+
+// ============ PIN DEFINITIONS ============
+
+// DHT11 pin
+#define DHT11_PIN (1<<4)           // P0.4
+
+// Ultrasonic pins
+#define TRIG_PIN (1 << 5)          // P0.5
+#define ECHO_PIN (1 << 6)          // P0.6
+
+// Turbidity ADC Channel
+#define TURBIDITY_CHANNEL 0        // AD0.0 (P0.23)
+
+// pH Sensor ADC Channel
+#define PH_CHANNEL 1               // AD0.1 (P0.24)
+
+// DO Sensor ADC Channel
+#define DO_CHANNEL 2               // AD0.2 (P0.25)
+
+// LCD Control pins - 4-bit mode
+#define RS (1<<10)                 // P0.10
+#define EN (1<<11)                 // P0.11
+
+// LCD Data pins - 8-bit mode (P0.15 to P0.22)
+#define LCD_DATA_MASK 0x007F8000   // P0.15-P0.22
+#define LCD_DATA_SHIFT 15
+
+// ============ CONSTANTS ============
+#define VREF 3.3
+
+// TURBIDITY THRESHOLDS
+#define VOLTAGE_CLEAN 1.80
+#define VOLTAGE_TURBID 1.00
+
+#define TURBIDITY_EXCELLENT 0
+#define TURBIDITY_GOOD 30
+#define TURBIDITY_ACCEPTABLE 50
+#define TURBIDITY_WARNING 100
+#define TURBIDITY_CRITICAL 200
+
+// DO Sensor calibration
+#define ADC_MAX 4095.0f
+
+// ============ GLOBAL VARIABLES ============
+char buffer[500];
+char lcd_buffer[20];
+char temp_buffer[20];
+uint8_t dht11_data[5];
+float temperature = 25.0, humidity = 30;
+
+// DO Sensor globals
+float do_concentration = 0.0f;
+float voltage = 0.0f; 
+// ============ FUNCTION PROTOTYPES ============
+
+// Delay functions
+void delay_us(uint32_t us);
+void delay_ms(uint32_t ms);
+
+// UART functions
+void init_uart0(void);
+void uart_send_char(char c);
+void uart_send_string(char *str);
+void uart_send_float(float value, unsigned char decimals);
+
+// UART3 functions (for ESP communication)
+void UART3_Init(void);
+void UART3_SendChar(char c);
+void UART3_SendString(const char *s);
+void UART3_SendFloat(float value, unsigned char decimals);
+
+// DHT11 functions
+uint8_t read_dht11(void);
+
+// LCD functions (8-bit mode)
+void lcd_init(void);
+void lcd_command(unsigned char cmd);
+void lcd_data(unsigned char data);
+void lcd_string(char *str);
+void lcd_clear(void);
+void lcd_goto(unsigned char row, unsigned char col);
+void lcd_enable_pulse(void);
+void lcd_float(float value, unsigned char decimals);
+
+// Ultrasonic functions
+void Timer0_Init(void);
+void Timer0_Start(void);
+void Timer0_Stop(void);
+unsigned int Timer0_GetValue(void);
+float measureDistance(void);
+
+// Turbidity functions
+void ADC_Init(void);
+uint16_t ADC_Read(uint8_t channel);
+uint16_t read_turbidity(void);
+void display_turbidity_status(uint16_t ntu);
+
+// pH Sensor functions
+float read_ph_sensor(void);
+void display_ph_status(float phValue);
+
+// DO Sensor functions
+float DO_GetVoltage(unsigned int adc_val);
+float DO_ConvertToMgL(float voltage);
+
+// ============ MAIN FUNCTION ============
+
+int main(void) {
+    float distance;
+    uint16_t turbidity_ntu;
+    uint16_t adc_value;
+    float voltage;
+    float phValue;
+    float do_value;
+    unsigned int do_adc_value;
+    
+    // Initialize peripherals
+    init_uart0();
+    UART3_Init();  // Initialize UART3 for ESP communication
+    lcd_init();
+    Timer0_Init();
+    ADC_Init();
+    
+    // Configure DHT11 pin
+    LPC_GPIO0->FIODIR |= DHT11_PIN;
+    LPC_PINCON->PINSEL0 &= ~(3 << 8);       // P0.4 as GPIO
+    
+    // Configure Ultrasonic pins
+    LPC_GPIO0->FIODIR |= TRIG_PIN;          // P0.5 as Output
+    LPC_GPIO0->FIODIR &= ~ECHO_PIN;         // P0.6 as Input
+    LPC_PINCON->PINSEL0 &= ~(3 << 10);      // P0.5 as GPIO
+    LPC_PINCON->PINSEL0 &= ~(3 << 12);      // P0.6 as GPIO
+    
+    // Welcome message
+    lcd_clear();
+    lcd_goto(0, 0);
+    lcd_string("Multi-Sensor");
+    lcd_goto(1, 0);
+    lcd_string("System Ready");
+    delay_ms(2000);
+    
+    uart_send_string("\r\n=============================================\r\n");
+    uart_send_string("  MULTI-SENSOR MONITORING SYSTEM\r\n");
+    uart_send_string("  DHT11 + Ultrasonic + Turbidity + pH + DO\r\n");
+    uart_send_string("=============================================\r\n\r\n");
+    
+    // Send welcome message to ESP via UART3
+    UART3_SendString("{\"system\":\"started\"}\n");
+    
+    while(1) {
+             // ========== 1. Read DHT11 (Temperature & Humidity) ==========
+        lcd_clear();
+        delay_ms(10);
+        
+        if(read_dht11()) {
+            // Convert to integers for reliable display
+            int temp_int = (int)temperature;
+            int temp_dec = (int)((temperature - temp_int) * 10);
+            int hum_int = (int)humidity;
+            int hum_dec = (int)((humidity - hum_int) * 10);
+            
+            // UART output - JSON FORMAT
+            sprintf(buffer, "{\"temp\":%.1f C,\"hum\":%.1f%%}\r\n", temperature, humidity);
+            uart_send_string(buffer);
+   // Send to ESP via UART3 - JSON FORMAT					
+					sprintf(buffer,
+  "{\"temp\":%.1f,\"hum\":%.1f}\n",
+  temperature, humidity
+);
+UART3_SendString(buffer);
+
+            
+            // LCD display with integers to avoid formatting issues
+            lcd_goto(0, 0);
+            sprintf(temp_buffer, "Temp:%d.%dC ", temp_int, temp_dec);
+            lcd_string(temp_buffer);
+            lcd_goto(1, 0);
+            sprintf(temp_buffer, "Hum:%d.%d%%",  hum_int, hum_dec);
+            lcd_string(temp_buffer);
+        } else {
+            uart_send_string("{\"sensor\":\"DHT11\",\"error\":\"read_failed\"}\r\n");
+            UART3_SendString("TEMP:ERR,HUM:ERR\r\n");
+            lcd_goto(0, 0);
+            lcd_string("Temp:--C");
+            lcd_goto(1, 0);
+            lcd_string("Hum:--%");
+        }
+        delay_ms(2500);
+        
+        // ========== 2. Read Ultrasonic (Distance) ==========
+        lcd_clear();
+        delay_ms(10);
+        
+        distance = measureDistance();
+        
+        if(distance > 0 && distance < 400) {
+            // Convert to integers
+            int dist_int = (int)distance;
+            int dist_dec = (int)((distance - dist_int) * 10);
+            
+            // UART output
+            sprintf(buffer, "Distance: %.2f cm\r\n", distance);
+            uart_send_string(buffer);
+            
+            // Send JSON to ESP via UART3
+            UART3_SendString("{\"dist\":");
+            UART3_SendFloat(distance, 2);
+            UART3_SendString(",\"level\":\"");
+            
+            if(distance >= 25) {
+                UART3_SendString("LOW");
+            } else if(distance >= 15 && distance < 25) {
+                UART3_SendString("MEDIUM");
+            } else {
+                UART3_SendString("HIGH");
+            }
+            UART3_SendString("\"}\n");
+            
+            // LCD display
+            lcd_goto(0, 0);
+            sprintf(lcd_buffer, "Dist:%d.%dcm", dist_int, dist_dec);
+            lcd_string(lcd_buffer);
+            
+            lcd_goto(1, 0);
+            if(distance >= 25) {
+                lcd_string("Level: LOW");
+                uart_send_string("Level: LOW\r\n");
+            } else if(distance >= 15 && distance < 25) {
+                lcd_string("Level: MEDIUM");
+                uart_send_string("Level: MEDIUM\r\n");
+            } else {
+                lcd_string("Level: HIGH");
+                uart_send_string("Level: HIGH\r\n");
+            }
+        } else {
+            uart_send_string("Ultrasonic: Out of range\r\n");
+            UART3_SendString("{\"dist\":\"ERROR\",\"level\":\"ERROR\"}\n");
+            lcd_goto(0, 0);
+            lcd_string("Distance: ---");
+            lcd_goto(1, 0);
+            lcd_string("Out of Range");
+        }
+        delay_ms(2500);
+        
+        // ========== 3. Read Turbidity ==========
+        lcd_clear();
+        delay_ms(10);
+        
+        // Read sensor with averaging
+        uint32_t sum = 0;
+        for(uint8_t i = 0; i < 10; i++) {
+            sum += ADC_Read(TURBIDITY_CHANNEL);
+            delay_ms(10);
+        }
+        adc_value = sum / 10;
+        voltage = ((float)adc_value * 3.3) / 4095.0;
+        turbidity_ntu = read_turbidity();
+        
+        // Convert voltage to integers
+        int volt_int = (int)voltage;
+        int volt_dec = (int)((voltage - volt_int) * 100);
+        
+        // UART output
+        sprintf(buffer, "Turbidity: %d NTU  Voltage: %.2f V\r\n", turbidity_ntu, voltage);
+        uart_send_string(buffer);
+        display_turbidity_status(turbidity_ntu);
+        
+        // Send JSON to ESP via UART3
+        UART3_SendString("{\"turb\":");
+        UART3_SendFloat((float)turbidity_ntu, 0);
+        UART3_SendString(",\"volt\":");
+        UART3_SendFloat(voltage, 2);
+        UART3_SendString(",\"status\":\"");
+        
+        if(turbidity_ntu <= TURBIDITY_GOOD) {
+            UART3_SendString("EXCELLENT");
+        } else if(turbidity_ntu <= TURBIDITY_ACCEPTABLE) {
+            UART3_SendString("GOOD");
+        } else if(turbidity_ntu <= TURBIDITY_WARNING) {
+            UART3_SendString("WARNING");
+        } else if(turbidity_ntu <= TURBIDITY_CRITICAL) {
+            UART3_SendString("POOR");
+        } else {
+            UART3_SendString("CRITICAL");
+        }
+        UART3_SendString("\"}\n");
+        
+        // LCD display
+        lcd_goto(0, 0);
+        sprintf(lcd_buffer, "NTU:%d V:%d.%02d", turbidity_ntu, volt_int, volt_dec);
+        lcd_string(lcd_buffer);
+        
+        lcd_goto(1, 0);
+        if(turbidity_ntu <= TURBIDITY_GOOD) {
+            lcd_string("EXCELLENT");
+        } else if(turbidity_ntu <= TURBIDITY_ACCEPTABLE) {
+            lcd_string("GOOD");
+        } else if(turbidity_ntu <= TURBIDITY_WARNING) {
+            lcd_string("WARNING");
+        } else if(turbidity_ntu <= TURBIDITY_CRITICAL) {
+            lcd_string("POOR");
+        } else {
+            lcd_string("CRITICAL");
+        }
+        
+        uart_send_string("\r\n");
+        delay_ms(2500);
+        
+        // ========== 4. Read pH Sensor ==========
+        lcd_clear();
+        delay_ms(10);
+        
+        phValue = read_ph_sensor();
+        
+        // Convert pH to integers
+        int ph_int = (int)phValue;
+        int ph_dec = (int)((phValue - ph_int) * 100);
+        
+        // UART output
+        sprintf(buffer, "pH: %.2f\r\n", phValue);
+        uart_send_string(buffer);
+        display_ph_status(phValue);
+        
+        // Send JSON to ESP via UART3
+        UART3_SendString("{\"ph\":");
+        UART3_SendFloat(phValue, 2);
+        UART3_SendString(",\"status\":\"");
+        
+        if(phValue >= 0 && phValue < 6) {
+            UART3_SendString("ACIDIC");
+        } else if(phValue >= 6 && phValue <= 8) {
+            UART3_SendString("NEUTRAL");
+        } else if(phValue > 8 && phValue <= 14) {
+            UART3_SendString("ALKALINE");
+        } else {
+            UART3_SendString("OUT_OF_RANGE");
+        }
+        UART3_SendString("\"}\n");
+        
+        // LCD display
+        lcd_goto(0, 0);
+        sprintf(lcd_buffer, "pH: %d.%02d", ph_int, ph_dec);
+        lcd_string(lcd_buffer);
+        
+        lcd_goto(1, 0);
+        if(phValue >= 0 && phValue < 6) {
+            lcd_string("ACIDIC");
+        } else if(phValue >= 6 && phValue <= 8) {
+            lcd_string("NEUTRAL");
+        } else if(phValue > 8 && phValue <= 14) {
+            lcd_string("ALKALINE");
+        } else {
+            lcd_string("OUT OF RANGE");
+        }
+        
+        uart_send_string("\r\n");
+        delay_ms(2500);
+        
+ // ========== 5. Read DO Sensor ==========
+        lcd_clear();
+        delay_ms(10);
+        
+        unsigned int do_sensor_adc = ADC_Read(DO_CHANNEL);
+        float do_sensor_voltage = DO_GetVoltage(do_sensor_adc);
+        float do_sensor_concentration = DO_ConvertToMgL(do_sensor_voltage);
+        
+        // DEBUG: Check values immediately after calculation
+        uart_send_string("DEBUG: ADC=");
+        sprintf(buffer, "%u", do_sensor_adc);
+        uart_send_string(buffer);
+        uart_send_string(" Voltage=");
+        uart_send_float(do_sensor_voltage, 2);
+        uart_send_string(" Concentration=");
+        uart_send_float(do_sensor_concentration, 2);
+        uart_send_string("\r\n");
+        
+        // Convert to integers for display
+        int do_int = (int)do_sensor_concentration;
+        int do_dec = (int)((do_sensor_concentration - do_int) * 100);
+        int do_volt_int = (int)do_sensor_voltage;
+        int do_volt_dec = (int)((do_sensor_voltage - do_volt_int) * 100);
+        
+        // Determine status
+        char* do_status;
+        if(do_sensor_concentration < 3.0f) {
+            do_status = "CRITICAL";
+        } else if(do_sensor_concentration < 5.0f) {
+            do_status = "WARNING";
+        } else if(do_sensor_concentration < 6.0f) {
+            do_status = "CAUTION";
+        } else if(do_sensor_concentration > 16.0f) {
+            do_status = "HIGH";
+        } else {
+            do_status = "GOOD";
+        }
+        
+        // UART Output - JSON FORMAT
+        sprintf(buffer, "{\"sensor\":\"DO\",\"concentration\":%.2f,\"voltage\":%.2f,\"status\":\"%s\",\"unit\":\"mg/L\"}\r\n", 
+                do_sensor_concentration, do_sensor_voltage, do_status);
+        uart_send_string(buffer);
+        
+       
+        // Send JSON to ESP via UART3
+        sprintf(buffer, "{\"do\":%.2f,\"status\":\"%s\"}\n", do_sensor_concentration, do_status);
+        
+        UART3_SendString(buffer);
+        delay_ms(100);
+        
+        // LCD Display
+        lcd_goto(0, 0);
+        sprintf(lcd_buffer, "V:%d.%02dV", do_volt_int, do_volt_dec);
+        lcd_string(lcd_buffer);
+        
+        lcd_goto(1, 0);
+        sprintf(lcd_buffer, "DO:%d.%02dmg/L", do_int, do_dec);
+        lcd_string(lcd_buffer);
+        delay_ms(2500);
+    }  
+}      
+
+
+// ============ DHT11 FUNCTIONS ============
+
+uint8_t read_dht11(void) {
+    uint8_t i, j;
+    uint32_t timeout;
+    
+    for(i = 0; i < 5; i++) dht11_data[i] = 0;
+    
+    // Start signal
+    LPC_GPIO0->FIODIR |= DHT11_PIN;
+    LPC_GPIO0->FIOCLR = DHT11_PIN;
+    delay_ms(18);
+    LPC_GPIO0->FIOSET = DHT11_PIN;
+    delay_us(30);
+    LPC_GPIO0->FIODIR &= ~DHT11_PIN;
+    
+    // Wait for DHT11 response
+    timeout = 0;
+    while((LPC_GPIO0->FIOPIN & DHT11_PIN) && timeout++ < 1000);
+    if(timeout >= 1000) return 0;
+    
+    timeout = 0;
+    while(!(LPC_GPIO0->FIOPIN & DHT11_PIN) && timeout++ < 1000);
+    if(timeout >= 1000) return 0;
+    
+    timeout = 0;
+    while((LPC_GPIO0->FIOPIN & DHT11_PIN) && timeout++ < 1000);
+    if(timeout >= 1000) return 0;
+    
+    // Read 40 bits
+    for(i = 0; i < 5; i++) {
+        for(j = 0; j < 8; j++) {
+            timeout = 0;
+            while(!(LPC_GPIO0->FIOPIN & DHT11_PIN) && timeout++ < 1000);
+            if(timeout >= 1000) return 0;
+            
+            delay_us(30);
+            if(LPC_GPIO0->FIOPIN & DHT11_PIN) {
+                dht11_data[i] |= (1 << (7-j));
+            }
+            
+            timeout = 0;
+            while((LPC_GPIO0->FIOPIN & DHT11_PIN) && timeout++ < 1000);
+            if(timeout >= 1000) return 0;
+        }
+    }
+    
+    // Verify checksum
+    uint8_t checksum = dht11_data[0] + dht11_data[1] + dht11_data[2] + dht11_data[3];
+    if(checksum != dht11_data[4]) return 0;
+    
+    humidity = (float)dht11_data[0] + ((float)dht11_data[1] / 10.0f);
+    temperature = (float)dht11_data[2] + ((float)dht11_data[3] / 10.0f);
+    
+    return 1;
+}
+
+// ============ ULTRASONIC FUNCTIONS ============
+
+float measureDistance(void) {
+    unsigned int duration;
+    float distance;
+    unsigned int timeout;
+    
+    // Send trigger pulse
+    LPC_GPIO0->FIOCLR = TRIG_PIN;
+    for(volatile int i = 0; i < 50; i++);
+    LPC_GPIO0->FIOSET = TRIG_PIN;
+    for(volatile int i = 0; i < 250; i++);
+    LPC_GPIO0->FIOCLR = TRIG_PIN;
+    
+    // Wait for echo high
+    timeout = 0;
+    while(!(LPC_GPIO0->FIOPIN & ECHO_PIN)) {
+        timeout++;
+        if(timeout > 300000) return -1;
+    }
+    
+    Timer0_Start();
+    
+    // Wait for echo low
+    timeout = 0;
+    while(LPC_GPIO0->FIOPIN & ECHO_PIN) {
+        timeout++;
+        if(timeout > 300000) {
+            Timer0_Stop();
+            return -1;
+        }
+    }
+    
+    Timer0_Stop();
+    duration = Timer0_GetValue();
+    
+    // Calculate distance
+    distance = (duration * 0.0343) / 2.0;
+    
+    return distance;
+}
+
+void Timer0_Init(void) {
+    LPC_SC->PCONP |= (1 << 1);
+    LPC_TIM0->CTCR = 0x0;
+    LPC_TIM0->PR = 24;
+    LPC_TIM0->TCR = 0x02;
+}
+
+void Timer0_Start(void) {
+    LPC_TIM0->TCR = 0x02;
+    LPC_TIM0->TCR = 0x01;
+}
+
+void Timer0_Stop(void) {
+    LPC_TIM0->TCR = 0x00;
+}
+
+unsigned int Timer0_GetValue(void) {
+    return LPC_TIM0->TC;
+}
+
+// ============ TURBIDITY FUNCTIONS ============
+
+void ADC_Init(void) {
+    LPC_SC->PCONP |= (1 << 12);             // Power on ADC
+    
+    // Configure AD0.0 (P0.23) for Turbidity
+    LPC_PINCON->PINSEL1 &= ~(3 << 14);
+    LPC_PINCON->PINSEL1 |= (1 << 14);       // P0.23 as AD0.0
+    LPC_PINCON->PINMODE1 &= ~(3 << 14);
+    LPC_PINCON->PINMODE1 |= (2 << 14);      // No pull-up/pull-down
+    
+    // Configure AD0.1 (P0.24) for pH Sensor
+    LPC_PINCON->PINSEL1 &= ~(3 << 16);
+    LPC_PINCON->PINSEL1 |= (1 << 16);       // P0.24 as AD0.1
+    LPC_PINCON->PINMODE1 &= ~(3 << 16);
+    LPC_PINCON->PINMODE1 |= (2 << 16);      // No pull-up/pull-down
+    
+    // Configure AD0.2 (P0.25) for DO Sensor
+    LPC_PINCON->PINSEL1 &= ~(3 << 18);
+    LPC_PINCON->PINSEL1 |= (1 << 18);       // P0.25 as AD0.2
+    LPC_PINCON->PINMODE1 &= ~(3 << 18);
+    LPC_PINCON->PINMODE1 |= (2 << 18);      // No pull-up/pull-down
+    
+    LPC_ADC->ADCR = (24 << 8) | (1 << 21);  // CLKDIV=24, PDN=1
+}
+
+uint16_t ADC_Read(uint8_t channel) {
+    uint32_t result;
+    
+    LPC_ADC->ADCR &= 0xFFFFFF00;
+    LPC_ADC->ADCR |= (1 << channel) | (1 << 24);  // Select channel and start
+    
+    while(!(LPC_ADC->ADGDR & (1 << 31)));         // Wait for conversion
+    
+    result = LPC_ADC->ADGDR;
+    return (result >> 4) & 0xFFF;                 // 12-bit result
+}
+
+uint16_t read_turbidity(void) {
+    uint16_t adc_value;
+    float voltage;
+    float ntu;
+    
+    // Average 10 readings
+    uint32_t sum = 0;
+    for(uint8_t i = 0; i < 10; i++) {
+        sum += ADC_Read(TURBIDITY_CHANNEL);
+        delay_ms(10);
+    }
+    adc_value = sum / 10;
+    
+    // Convert to voltage
+    voltage = ((float)adc_value * 3.3) / 4095.0;
+    
+    // Custom calibration
+    if(voltage >= VOLTAGE_CLEAN) {
+        ntu = 0;
+    } else if(voltage >= VOLTAGE_CLEAN - 0.1) {
+        ntu = (VOLTAGE_CLEAN - voltage) * 200.0;
+    } else if(voltage >= VOLTAGE_CLEAN - 0.3) {
+        ntu = 20.0 + ((VOLTAGE_CLEAN - 0.1) - voltage) * 400.0;
+    } else if(voltage >= VOLTAGE_TURBID) {
+        ntu = 100.0 + ((VOLTAGE_CLEAN - 0.3) - voltage) * 800.0;
+    } else {
+        ntu = 500.0 + (VOLTAGE_TURBID - voltage) * 1000.0;
+    }
+    
+    if(ntu < 0) ntu = 0;
+    return (uint16_t)ntu;
+}
+
+void display_turbidity_status(uint16_t ntu) {
+    if(ntu <= TURBIDITY_GOOD) {
+        uart_send_string("Status: EXCELLENT - Optimal clarity\r\n");
+    } else if(ntu <= TURBIDITY_ACCEPTABLE) {
+        uart_send_string("Status: GOOD - Acceptable clarity\r\n");
+    } else if(ntu <= TURBIDITY_WARNING) {
+        uart_send_string("Status: WARNING - Check filters\r\n");
+    } else if(ntu <= TURBIDITY_CRITICAL) {
+        uart_send_string("Status: POOR - Action needed\r\n");
+    } else {
+        uart_send_string("Status: CRITICAL - Urgent action required\r\n");
+    }
+}
+
+// ============ pH SENSOR FUNCTIONS ============
+
+float read_ph_sensor(void) {
+    uint16_t adc_value;
+    float voltage;
+    float phValue;
+    
+    // Average 10 readings
+    uint32_t sum = 0;
+    for(uint8_t i = 0; i < 10; i++) {
+        sum += ADC_Read(PH_CHANNEL);
+        delay_ms(10);
+    }
+    adc_value = sum / 10;
+    
+    // Convert to voltage
+    voltage = ((float)adc_value * VREF) / 4095.0f;
+    
+    if(voltage <= 2.8f) {
+        phValue = -10.0f * (voltage - 2.6f) + 10.0f;
+    } else if(voltage <= 3.23f) {
+        phValue = -4.76f * (voltage - 2.8f) + 8.0f;
+    } else {
+        phValue = -57.14f * (voltage - 3.23f) + 6.0f;
+    }
+    
+    if(phValue < 0.0f)  phValue = 0.0f;
+    if(phValue > 14.0f) phValue = 14.0f;
+    
+    return phValue;
+}
+
+void display_ph_status(float phValue) {
+    if(phValue >= 0 && phValue < 6) {
+        uart_send_string("Status: ACIDIC\r\n");
+    } else if(phValue >= 6 && phValue <= 8) {
+        uart_send_string("Status: NEUTRAL\r\n");
+    } else if(phValue > 8 && phValue <= 14) {
+        uart_send_string("Status: ALKALINE\r\n");
+    } else {
+        uart_send_string("Status: OUT OF RANGE\r\n");
+    }
+}
+
+// ============ DO SENSOR FUNCTIONS ============
+
+float DO_GetVoltage(unsigned int adc_val) {
+    return ((float)adc_val * VREF) / ADC_MAX;
+}
+
+float DO_ConvertToMgL(float voltage) {
+    if (voltage < 0.0f) voltage = 0.0f;
+    if (voltage > 3.0f) voltage = 3.0f;
+    return (voltage / 3.0f) * 20.0f;
+}
+// ============ LCD FUNCTIONS - 8-bit Mode ============
+
+void lcd_init(void) {
+    LPC_GPIO0->FIODIR |= (RS | EN | LCD_DATA_MASK);
+    
+    LPC_GPIO0->FIOCLR = (RS | EN | LCD_DATA_MASK);
+    
+    delay_ms(50);
+    
+    lcd_command(0x38);
+    delay_ms(5);
+    lcd_command(0x38);
+    delay_us(150);
+    lcd_command(0x38);
+    lcd_command(0x38);
+    lcd_command(0x0C);
+    lcd_command(0x06);
+    lcd_command(0x01);
+    delay_ms(2);
+}
+
+void lcd_enable_pulse(void) {
+    LPC_GPIO0->FIOSET = EN;
+    delay_us(10);
+    LPC_GPIO0->FIOCLR = EN;
+    delay_us(10);
+}
+
+void lcd_command(unsigned char cmd) {
+    LPC_GPIO0->FIOCLR = RS;
+    LPC_GPIO0->FIOCLR = LCD_DATA_MASK;
+    LPC_GPIO0->FIOSET = ((unsigned int)cmd << LCD_DATA_SHIFT) & LCD_DATA_MASK;
+    lcd_enable_pulse();
+    delay_us(50);
+}
+
+void lcd_data(unsigned char data) {
+    LPC_GPIO0->FIOSET = RS;
+    LPC_GPIO0->FIOCLR = LCD_DATA_MASK;
+    LPC_GPIO0->FIOSET = ((unsigned int)data << LCD_DATA_SHIFT) & LCD_DATA_MASK;
+    lcd_enable_pulse();
+    delay_us(50);
+}
+
+void lcd_string(char *str) {
+    while(*str) {
+        lcd_data(*str++);
+    }
+}
+
+void lcd_clear(void) {
+    lcd_command(0x01);
+    delay_ms(2);
+}
+
+void lcd_goto(unsigned char row, unsigned char col) {
+    unsigned char position;
+    if(row == 0)
+        position = 0x80 + col;
+    else
+        position = 0xC0 + col;
+    lcd_command(position);
+}
+
+void lcd_float(float value, unsigned char decimals) {
+    int int_part;
+    float frac_part;
+    unsigned int frac_int;
+    unsigned char i;
+    char buffer[16];
+    unsigned char index = 0;
+    
+    if(value < 0) {
+        lcd_data('-');
+        value = -value;
+    }
+    
+    int_part = (int)value;
+    
+    if(int_part == 0) {
+        buffer[index++] = '0';
+    } else {
+        unsigned char temp_index = 0;
+        char temp[10];
+        while(int_part > 0) {
+            temp[temp_index++] = (int_part % 10) + '0';
+            int_part /= 10;
+        }
+        while(temp_index > 0) {
+            buffer[index++] = temp[--temp_index];
+        }
+    }
+    
+    if(decimals > 0) {
+        buffer[index++] = '.';
+        frac_part = value - (int)value;
+        for(i = 0; i < decimals; i++) {
+            frac_part *= 10;
+        }
+        frac_int = (unsigned int)frac_part;
+        
+        for(i = 0; i < decimals; i++) {
+            unsigned int divisor = 1;
+            unsigned char j;
+            for(j = 0; j < (decimals - i - 1); j++) {
+                divisor *= 10;
+            }
+            buffer[index++] = (frac_int / divisor) % 10 + '0';
+        }
+    }
+    
+    buffer[index] = '\0';
+    lcd_string(buffer);
+}
+
+// ============ UART0 FUNCTIONS ============
+
+void init_uart0(void) {
+    LPC_SC->PCONP |= (1<<3);
+    LPC_SC->PCLKSEL0 &= ~(3<<6);
+    LPC_SC->PCLKSEL0 |= (1<<6);
+    
+    LPC_PINCON->PINSEL0 &= ~((3<<4) | (3<<6));
+    LPC_PINCON->PINSEL0 |= ((1<<4) | (1<<6));
+    
+    LPC_UART0->LCR = 0x83;
+    uint16_t dl = 651;
+    LPC_UART0->DLL = dl & 0xFF;
+    LPC_UART0->DLM = (dl >> 8) & 0xFF;
+    LPC_UART0->LCR = 0x03;
+    LPC_UART0->FCR = 0x07;
+}
+
+void uart_send_char(char c) {
+    while(!(LPC_UART0->LSR & (1<<5)));
+    LPC_UART0->THR = c;
+}
+
+void uart_send_string(char *str) {
+    while(*str) {
+        if(*str == '\n') {
+            uart_send_char('\r');
+        }
+        uart_send_char(*str++);
+    }
+}
+
+void uart_send_float(float value, unsigned char decimals) {
+    int int_part;
+    float frac_part;
+    unsigned int frac_int;
+    unsigned char i;
+    char buffer[20];
+    unsigned char index = 0;
+    
+    if(value < 0) {
+        uart_send_char('-');
+        value = -value;
+    }
+    
+    int_part = (int)value;
+    
+    if(int_part == 0) {
+        buffer[index++] = '0';
+    } else {
+        unsigned char temp_index = 0;
+        char temp[10];
+        while(int_part > 0) {
+            temp[temp_index++] = (int_part % 10) + '0';
+            int_part /= 10;
+        }
+        while(temp_index > 0) {
+            buffer[index++] = temp[--temp_index];
+        }
+    }
+    
+    if(decimals > 0) {
+        buffer[index++] = '.';
+        frac_part = value - (int)value;
+        for(i = 0; i < decimals; i++) {
+            frac_part *= 10;
+        }
+        frac_int = (unsigned int)frac_part;
+        
+        for(i = 0; i < decimals; i++) {
+            unsigned int divisor = 1;
+            unsigned char j;
+            for(j = 0; j < (decimals - i - 1); j++) {
+                divisor *= 10;
+            }
+            buffer[index++] = (frac_int / divisor) % 10 + '0';
+        }
+    }
+    
+    buffer[index] = '\0';
+    uart_send_string(buffer);
+}
+
+// ============ UART3 FUNCTIONS (ESP Communication) ============
+
+void UART3_Init(void) {
+    LPC_SC->PCONP |= (1 << 25);        // Power on UART3
+    LPC_PINCON->PINSEL0 |= (0xA << 0); // P0.0 as TXD3, P0.1 as RXD3
+    LPC_UART3->LCR = 0x83;             // 8-bit, 1 stop bit, DLAB=1
+    LPC_UART3->DLL = 0xA2;             // 9600 baud @ 25MHz PCLK
+    LPC_UART3->LCR = 0x03;             // DLAB=0
+}
+
+void UART3_SendChar(char c) {
+    while(!(LPC_UART3->LSR & (1 << 5))); // Wait for THR empty
+    LPC_UART3->THR = c;
+}
+
+void UART3_SendString(const char *s) {
+    while(*s) UART3_SendChar(*s++);
+}
+
+void UART3_SendFloat(float value, unsigned char decimals) {
+    int int_part;
+    float frac_part;
+    unsigned int frac_int;
+    unsigned char i;
+    char buffer[20];
+    unsigned char index = 0;
+    
+    if(value < 0) {
+        UART3_SendChar('-');
+        value = -value;
+    }
+    
+    int_part = (int)value;
+    
+    if(int_part == 0) {
+        buffer[index++] = '0';
+    } else {
+        unsigned char temp_index = 0;
+        char temp[10];
+        while(int_part > 0) {
+            temp[temp_index++] = (int_part % 10) + '0';
+            int_part /= 10;
+        }
+        while(temp_index > 0) {
+            buffer[index++] = temp[--temp_index];
+        }
+    }
+    
+    if(decimals > 0) {
+        buffer[index++] = '.';
+        frac_part = value - (int)value;
+        for(i = 0; i < decimals; i++) {
+            frac_part *= 10;
+        }
+        frac_int = (unsigned int)frac_part;
+        
+        for(i = 0; i < decimals; i++) {
+            unsigned int divisor = 1;
+            unsigned char j;
+            for(j = 0; j < (decimals - i - 1); j++) {
+                divisor *= 10;
+            }
+            buffer[index++] = (frac_int / divisor) % 10 + '0';
+        }
+    }
+    
+    buffer[index] = '\0';
+    UART3_SendString(buffer);
+}
+
+// ============ DELAY FUNCTIONS ============
+
+void delay_ms(uint32_t ms) {
+    for(uint32_t i = 0; i < ms; i++) {
+        for(volatile uint32_t j = 0; j < 10000; j++);
+    }
+}
+
+void delay_us(uint32_t us) {
+    for(volatile uint32_t i = 0; i < us * 10; i++);
+}
