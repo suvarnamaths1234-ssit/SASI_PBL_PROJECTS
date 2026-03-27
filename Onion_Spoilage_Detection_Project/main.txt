@@ -1,0 +1,642 @@
+#include <LPC17xx.h>
+#include <stdio.h>
+#include <stdint.h>
+#include <string.h>
+
+/* ==================== PIN DEFINITIONS ==================== */
+#define DHT11_PIN       (1<<0)      // P2.0
+#define BUZZER_PIN      (1<<27)     // P1.27
+
+/* ==================== RC522 REGISTER DEFINITIONS ==================== */
+#define CommandReg          0x01
+#define ComIEnReg           0x02
+#define ComIrqReg           0x04
+#define ErrorReg            0x06
+#define FIFODataReg         0x09
+#define FIFOLevelReg        0x0A
+#define ControlReg          0x0C
+#define BitFramingReg       0x0D
+#define ModeReg             0x11
+#define TxControlReg        0x14
+#define TxASKReg            0x15
+#define TModeReg            0x2A
+#define TPrescalerReg       0x2B
+#define TReloadRegL         0x2D
+
+#define PCD_IDLE            0x00
+#define PCD_TRANSCEIVE      0x0C
+#define PCD_SOFTRESET       0x0F
+#define PICC_REQIDL         0x26
+#define PICC_ANTICOLL       0x93
+
+#define MI_OK               0
+#define MI_NOTAGERR         1
+#define MI_ERR              2
+
+/* ==================== RC522 GPIO DEFINITIONS ==================== */
+#define RC522_CS_LOW()      LPC_GPIO0->FIOCLR = (1 << 6)
+#define RC522_CS_HIGH()     LPC_GPIO0->FIOSET = (1 << 6)
+#define RC522_RST_LOW()     LPC_GPIO2->FIOCLR = (1 << 1)
+#define RC522_RST_HIGH()    LPC_GPIO2->FIOSET = (1 << 1)
+
+/* ==================== SAFETY THRESHOLDS ==================== */
+#define TEMP_DANGER         45
+#define HUM_DANGER          85
+#define AIR_DANGER          3200
+#define AIR_SAFE            2600
+#define AIR_GOOD            1500
+#define AIR_MODERATE        2500
+
+/* ==================== REGISTERED CARDS DATABASE ==================== */
+#define NUM_REGISTERED_CARDS  5
+
+typedef struct {
+    uint8_t uid[4];
+    const char *name;
+    uint8_t inside;
+} RegisteredCard;
+
+RegisteredCard registeredCards[NUM_REGISTERED_CARDS] = {
+    {{0xD3, 0xF8, 0x5D, 0xEC}, "Raju", 0},
+    {{0x1A, 0x88, 0x36, 0x02}, "Abbas", 0},
+    {{0x35, 0x64, 0x94, 0x5F}, "Manoj", 0},
+    {{0xF3, 0x52, 0x22, 0x2A}, "Vennela", 0},
+    {{0x33, 0x84, 0xD0, 0xEC}, "Akash", 0}
+};
+
+/* ==================== GLOBAL VARIABLES ==================== */
+uint8_t dht11_data[5];
+int temperature = 0, humidity = 0;
+char json_buf[256];
+
+uint16_t totalEntries = 0;
+uint16_t totalExits = 0;
+uint16_t currentInsideCount = 0;
+uint16_t sensorCounter = 0;
+
+uint8_t alarm_active = 0;
+uint8_t admin_notified = 0;
+
+// NEW: Card removal detection variables
+uint8_t cardPresent = 0;
+uint8_t lastCardUID[4] = {0, 0, 0, 0};
+
+/* ==================== DELAY FUNCTIONS ==================== */
+void delay_us(uint32_t us)
+{
+    for(volatile uint32_t i=0; i<us*12; i++);
+}
+
+void delay_ms(uint32_t ms)
+{
+    for(uint32_t i=0; i<ms; i++)
+        for(volatile uint32_t j=0; j<8000; j++);
+}
+
+/* ==================== UART0 FUNCTIONS ==================== */
+void UART0_Init(uint32_t baudrate)
+{
+    uint32_t pclk, dll;
+    LPC_SC->PCONP |= (1 << 3);
+    LPC_SC->PCLKSEL0 &= ~(3 << 6);
+    pclk = 25000000;
+    dll = pclk / (16 * baudrate);
+    LPC_PINCON->PINSEL0 &= ~(0x0F << 4);
+    LPC_PINCON->PINSEL0 |= (1 << 4) | (1 << 6);
+    LPC_UART0->LCR = 0x83;
+    LPC_UART0->DLL = dll & 0xFF;
+    LPC_UART0->DLM = (dll >> 8) & 0xFF;
+    LPC_UART0->LCR = 0x03;
+    LPC_UART0->FCR = 0x07;
+}
+
+void UART0_SendChar(char ch)
+{
+    while (!(LPC_UART0->LSR & (1 << 5)));
+    LPC_UART0->THR = ch;
+}
+
+void UART0_SendString(const char *str)
+{
+    while (*str) UART0_SendChar(*str++);
+}
+
+/* ==================== UART3 FUNCTIONS ==================== */
+void UART3_Init(void)
+{
+    LPC_SC->PCONP |= (1 << 25);
+    LPC_PINCON->PINSEL0 &= ~(0xF << 0);
+    LPC_PINCON->PINSEL0 |= (0xA << 0);
+    LPC_UART3->LCR = 0x83;
+    LPC_UART3->DLL = 0xA2;
+    LPC_UART3->DLM = 0x00;
+    LPC_UART3->LCR = 0x03;
+    LPC_UART3->FCR = 0x07;
+}
+
+void UART3_SendChar(char ch)
+{
+    while(!(LPC_UART3->LSR & (1 << 5)));
+    LPC_UART3->THR = ch;
+}
+
+void UART3_SendString(const char *str)
+{
+    while(*str) UART3_SendChar(*str++);
+}
+
+/* ==================== DHT11 FUNCTIONS ==================== */
+uint8_t read_dht11(void)
+{
+    uint8_t i, j;
+    uint32_t timeout;
+
+    for(i=0; i<5; i++) dht11_data[i]=0;
+
+    LPC_GPIO2->FIODIR |= DHT11_PIN;
+    LPC_GPIO2->FIOCLR = DHT11_PIN;
+    delay_ms(20);
+    LPC_GPIO2->FIOSET = DHT11_PIN;
+    delay_us(30);
+    LPC_GPIO2->FIODIR &= ~DHT11_PIN;
+
+    timeout=0;
+    while((LPC_GPIO2->FIOPIN & DHT11_PIN) && timeout++<10000);
+    if(timeout>=10000) return 0;
+
+    timeout=0;
+    while(!(LPC_GPIO2->FIOPIN & DHT11_PIN) && timeout++<10000);
+    if(timeout>=10000) return 0;
+
+    timeout=0;
+    while((LPC_GPIO2->FIOPIN & DHT11_PIN) && timeout++<10000);
+    if(timeout>=10000) return 0;
+
+    for(i=0; i<5; i++) {
+        for(j=0; j<8; j++) {
+            while(!(LPC_GPIO2->FIOPIN & DHT11_PIN));
+            delay_us(30);
+            if(LPC_GPIO2->FIOPIN & DHT11_PIN)
+                dht11_data[i] |= (1<<(7-j));
+            while(LPC_GPIO2->FIOPIN & DHT11_PIN);
+        }
+    }
+
+    if((dht11_data[0]+dht11_data[1]+dht11_data[2]+dht11_data[3]) != dht11_data[4])
+        return 0;
+
+    humidity = dht11_data[0];
+    temperature = dht11_data[2];
+    return 1;
+}
+
+/* ==================== MQ135 ADC FUNCTIONS ==================== */
+void init_adc(void)
+{
+    LPC_SC->PCONP |= (1<<12);
+    LPC_SC->PCLKSEL0 &= ~(3<<24);
+    LPC_PINCON->PINSEL1 &= ~(3 << 14);
+    LPC_PINCON->PINSEL1 |= (1<<14);
+    LPC_ADC->ADCR = (4<<8) | (1<<21);
+}
+
+uint16_t read_mq135(void)
+{
+    LPC_ADC->ADCR &= ~0xFF;
+    LPC_ADC->ADCR |= (1 << 0);
+    LPC_ADC->ADCR |= (1<<24);
+    while(!(LPC_ADC->ADGDR & (1<<31)));
+    return (uint16_t)((LPC_ADC->ADGDR >> 4) & 0xFFF);
+}
+
+/* ==================== SPI (SSP1) FUNCTIONS ==================== */
+void SSP1_Init(void)
+{
+    LPC_SC->PCONP |= (1 << 10);
+    LPC_PINCON->PINSEL0 |= (2 << 14) | (2 << 16) | (2 << 18);
+    LPC_GPIO0->FIODIR |= (1 << 6);
+    LPC_GPIO2->FIODIR |= (1 << 1);
+    RC522_CS_HIGH();
+    RC522_RST_HIGH();
+    LPC_SSP1->CR0 = 0x0707;
+    LPC_SSP1->CPSR = 8;
+    LPC_SSP1->CR1 = 0x02;
+}
+
+uint8_t SPI_Transfer(uint8_t data)
+{
+    LPC_SSP1->DR = data;
+    while (LPC_SSP1->SR & (1 << 4));
+    while (!(LPC_SSP1->SR & (1 << 2)));
+    return LPC_SSP1->DR;
+}
+
+/* ==================== RC522 LOW-LEVEL FUNCTIONS ==================== */
+void RC522_WriteRegister(uint8_t reg, uint8_t value)
+{
+    RC522_CS_LOW();
+    SPI_Transfer((reg << 1) & 0x7E);
+    SPI_Transfer(value);
+    RC522_CS_HIGH();
+}
+
+uint8_t RC522_ReadRegister(uint8_t reg)
+{
+    uint8_t value;
+    RC522_CS_LOW();
+    SPI_Transfer(((reg << 1) & 0x7E) | 0x80);
+    value = SPI_Transfer(0x00);
+    RC522_CS_HIGH();
+    return value;
+}
+
+void RC522_SetBitMask(uint8_t reg, uint8_t mask)
+{
+    uint8_t current = RC522_ReadRegister(reg);
+    RC522_WriteRegister(reg, current | mask);
+}
+
+void RC522_ClearBitMask(uint8_t reg, uint8_t mask)
+{
+    uint8_t current = RC522_ReadRegister(reg);
+    RC522_WriteRegister(reg, current & (~mask));
+}
+
+void RC522_AntennaOn(void)
+{
+    uint8_t value = RC522_ReadRegister(TxControlReg);
+    if ((value & 0x03) != 0x03) {
+        RC522_WriteRegister(TxControlReg, value | 0x03);
+    }
+}
+
+void RC522_Reset(void)
+{
+    RC522_WriteRegister(CommandReg, PCD_SOFTRESET);
+    delay_ms(50);
+}
+
+void RC522_Init(void)
+{
+    RC522_RST_LOW();
+    delay_ms(10);
+    RC522_RST_HIGH();
+    delay_ms(50);
+    RC522_Reset();
+    RC522_WriteRegister(TModeReg, 0x8D);
+    RC522_WriteRegister(TPrescalerReg, 0x3E);
+    RC522_WriteRegister(TReloadRegL, 30);
+    RC522_WriteRegister(TxASKReg, 0x40);
+    RC522_WriteRegister(ModeReg, 0x3D);
+    RC522_AntennaOn();
+    delay_ms(10);
+}
+
+/* ==================== RC522 COMMUNICATION ==================== */
+uint8_t RC522_ToCard(uint8_t command, uint8_t *sendData, uint8_t sendLen,
+                     uint8_t *backData, uint8_t *backLen)
+{
+    uint8_t status = MI_ERR, irqEn = 0x00, waitIRq = 0x00, lastBits, n;
+    uint16_t i;
+
+    if (command == PCD_TRANSCEIVE) {
+        irqEn = 0x77;
+        waitIRq = 0x30;
+    }
+
+    RC522_WriteRegister(ComIEnReg, irqEn | 0x80);
+    RC522_ClearBitMask(ComIrqReg, 0x80);
+    RC522_SetBitMask(FIFOLevelReg, 0x80);
+    RC522_WriteRegister(CommandReg, PCD_IDLE);
+
+    for (i = 0; i < sendLen; i++)
+        RC522_WriteRegister(FIFODataReg, sendData[i]);
+
+    RC522_WriteRegister(CommandReg, command);
+    if (command == PCD_TRANSCEIVE)
+        RC522_SetBitMask(BitFramingReg, 0x80);
+
+    i = 2000;
+    do {
+        n = RC522_ReadRegister(ComIrqReg);
+        i--;
+    } while ((i != 0) && !(n & 0x01) && !(n & waitIRq));
+
+    RC522_ClearBitMask(BitFramingReg, 0x80);
+
+    if (i != 0) {
+        if (!(RC522_ReadRegister(ErrorReg) & 0x1B)) {
+            status = MI_OK;
+            if (n & irqEn & 0x01) status = MI_NOTAGERR;
+
+            if (command == PCD_TRANSCEIVE) {
+                n = RC522_ReadRegister(FIFOLevelReg);
+                lastBits = RC522_ReadRegister(ControlReg) & 0x07;
+                *backLen = lastBits ? (n - 1) * 8 + lastBits : n * 8;
+                if (n == 0) n = 1;
+                if (n > 16) n = 16;
+                for (i = 0; i < n; i++)
+                    backData[i] = RC522_ReadRegister(FIFODataReg);
+            }
+        } else {
+            status = MI_ERR;
+        }
+    }
+    return status;
+}
+
+/* ==================== RFID CARD OPERATIONS ==================== */
+uint8_t RC522_Request(uint8_t reqMode, uint8_t *TagType)
+{
+    uint8_t status, backBits, buffer[2];
+    RC522_WriteRegister(BitFramingReg, 0x07);
+    buffer[0] = reqMode;
+    status = RC522_ToCard(PCD_TRANSCEIVE, buffer, 1, buffer, &backBits);
+    if ((status == MI_OK) && (backBits == 0x10)) {
+        TagType[0] = buffer[0];
+        TagType[1] = buffer[1];
+        return MI_OK;
+    }
+    return MI_ERR;
+}
+
+uint8_t RC522_Anticoll(uint8_t *uid)
+{
+    uint8_t status, i, backBits, buffer[9], checksum = 0;
+    RC522_WriteRegister(BitFramingReg, 0x00);
+    buffer[0] = PICC_ANTICOLL;
+    buffer[1] = 0x20;
+    status = RC522_ToCard(PCD_TRANSCEIVE, buffer, 2, buffer, &backBits);
+    if (status == MI_OK) {
+        for (i = 0; i < 4; i++) {
+            uid[i] = buffer[i];
+            checksum ^= buffer[i];
+        }
+        if (checksum != buffer[4]) status = MI_ERR;
+    }
+    return status;
+}
+
+/* ==================== NEW: CARD REMOVAL DETECTION ==================== */
+uint8_t IsCardStillPresent(void)
+{
+    uint8_t cardType[2];
+    uint8_t status = RC522_Request(PICC_REQIDL, cardType);
+    return (status == MI_OK);
+}
+
+void WaitForCardRemoval(void)
+{
+    uint8_t removalCounter = 0;
+    
+    // Wait until card is confirmed removed (debounced)
+    while(removalCounter < 3) {
+        if(!IsCardStillPresent()) {
+            removalCounter++;
+        } else {
+            removalCounter = 0;
+        }
+        delay_ms(50);
+    }
+}
+
+uint8_t IsSameCard(uint8_t *uid1, uint8_t *uid2)
+{
+    for(uint8_t i = 0; i < 4; i++) {
+        if(uid1[i] != uid2[i]) return 0;
+    }
+    return 1;
+}
+
+/* ==================== CARD LOOKUP FUNCTIONS ==================== */
+int8_t FindCardIndex(uint8_t *uid)
+{
+    uint8_t i, j, match;
+    for (i = 0; i < NUM_REGISTERED_CARDS; i++) {
+        match = 1;
+        for (j = 0; j < 4; j++) {
+            if (uid[j] != registeredCards[i].uid[j]) {
+                match = 0;
+                break;
+            }
+        }
+        if (match) return i;
+    }
+    return -1;
+}
+
+uint8_t getInsideCount(void)
+{
+    uint8_t count = 0;
+    for(uint8_t i = 0; i < NUM_REGISTERED_CARDS; i++)
+        if(registeredCards[i].inside) count++;
+    return count;
+}
+
+/* ==================== BUZZER FUNCTIONS ==================== */
+void buzzer_short(void)
+{
+    LPC_GPIO1->FIOSET = BUZZER_PIN;
+    delay_ms(200);
+    LPC_GPIO1->FIOCLR = BUZZER_PIN;
+}
+
+void buzzer_long(void)
+{
+    LPC_GPIO1->FIOSET = BUZZER_PIN;
+    delay_ms(600);
+    LPC_GPIO1->FIOCLR = BUZZER_PIN;
+}
+
+/* ==================== JSON OUTPUT FUNCTIONS ==================== */
+void SendSensorJSON(int temp, int hum, uint16_t air_adc)
+{
+    const char *air_status;
+    
+    if(air_adc < AIR_GOOD) air_status = "Good";
+    else if(air_adc < AIR_MODERATE) air_status = "Moderate";
+    else air_status = "Bad";
+    
+    sprintf(json_buf, 
+            "ENV,{\"temp\":%d,\"hum\":%d,\"air\":%u,\"status\":\"%s\",\"inside\":%u}\r\n",
+            temp, hum, air_adc, air_status, currentInsideCount);
+    
+    UART0_SendString(json_buf);
+    UART3_SendString(json_buf);
+}
+
+void SendRFIDEventJSON(const char* event_type, uint8_t *uid, const char* name, uint8_t is_valid)
+{
+    char uid_str[12];
+    sprintf(uid_str, "%02X%02X%02X%02X", uid[0], uid[1], uid[2], uid[3]);
+    
+    if(is_valid) {
+        sprintf(json_buf,
+                "RFID,{\"name\":\"%s\",\"status\":\"%s\",\"uid\":\"%s\",\"inside\":%u}\r\n",
+                name, event_type, uid_str, currentInsideCount);
+    } else {
+        sprintf(json_buf,
+                "RFID,{\"name\":\"Unknown\",\"status\":\"DENIED\",\"uid\":\"%s\",\"inside\":%u}\r\n",
+                uid_str, currentInsideCount);
+    }
+    
+    UART0_SendString(json_buf);
+    UART3_SendString(json_buf);
+}
+
+void SendSystemStatusJSON(const char* status_msg)
+{
+    sprintf(json_buf, "STATUS,{\"message\":\"%s\",\"version\":\"2.0\"}\r\n", status_msg);
+    UART0_SendString(json_buf);
+    UART3_SendString(json_buf);
+}
+
+void SendAlertJSON(const char* alert_type, uint16_t air_val)
+{
+    sprintf(json_buf,
+            "ALERT,{\"type\":\"%s\",\"air\":%u,\"temp\":%d,\"hum\":%d,\"inside\":%u}\r\n",
+            alert_type, air_val, temperature, humidity, currentInsideCount);
+    
+    UART0_SendString(json_buf);
+    UART3_SendString(json_buf);
+}
+
+void SendCountJSON(void)
+{
+    sprintf(json_buf,
+            "COUNT,{\"inside\":%u,\"entries\":%u,\"exits\":%u}\r\n",
+            currentInsideCount, totalEntries, totalExits);
+    
+    UART0_SendString(json_buf);
+    UART3_SendString(json_buf);
+}
+
+/* ==================== MAIN FUNCTION ==================== */
+int main(void)
+{
+    uint8_t status, cardType[2], uid[5];
+    int8_t cardIndex;
+    uint16_t mq_adc = 0;
+
+    init_adc();
+    UART0_Init(9600);
+    UART3_Init();
+    SSP1_Init();
+    RC522_Init();
+
+    LPC_GPIO1->FIODIR |= BUZZER_PIN;
+    LPC_GPIO1->FIOCLR = BUZZER_PIN;
+
+    SendSystemStatusJSON("SYSTEM_READY");
+    delay_ms(2000);
+
+    while(1)
+    {
+        // ========== READ SENSORS PERIODICALLY ==========
+        sensorCounter++;
+        
+        if(sensorCounter >= 10) 
+        {
+            sensorCounter = 0;
+            
+            if(read_dht11()) {
+                // Valid reading
+            } else {
+                temperature = 0;
+                humidity = 0;
+            }
+            
+            mq_adc = read_mq135();
+            SendSensorJSON(temperature, humidity, mq_adc);
+        }
+
+        // ========== CHECK FOR RFID CARD (WITH PROPER DEBOUNCING) ==========
+        if(!cardPresent) {  // Only process new cards when no card is present
+            
+            status = RC522_Request(PICC_REQIDL, cardType);
+            
+            if (status == MI_OK) {
+                status = RC522_Anticoll(uid);
+                
+                if (status == MI_OK) {
+                    
+                    // Mark card as present
+                    cardPresent = 1;
+                    for(uint8_t i = 0; i < 4; i++) {
+                        lastCardUID[i] = uid[i];
+                    }
+                    
+                    cardIndex = FindCardIndex(uid);
+                    
+                    if (cardIndex >= 0) {
+                        
+                        if (registeredCards[cardIndex].inside == 0) {
+                            // ========== ENTRY ==========
+                            registeredCards[cardIndex].inside = 1;
+                            totalEntries++;
+                            currentInsideCount++;
+                            
+                            SendRFIDEventJSON("ENTRY", uid, registeredCards[cardIndex].name, 1);
+                            buzzer_short();
+                            
+                        } else {
+                            // ========== EXIT ==========
+                            registeredCards[cardIndex].inside = 0;
+                            totalExits++;
+                            if(currentInsideCount > 0) currentInsideCount--;
+                            
+                            SendRFIDEventJSON("EXIT", uid, registeredCards[cardIndex].name, 1);
+                            buzzer_long();
+                        }
+                        
+                        delay_ms(500);
+                        SendCountJSON();
+                        
+                    } else {
+                        // ========== ACCESS DENIED ==========
+                        SendRFIDEventJSON("", uid, "Unknown", 0);
+                        buzzer_long();
+                        delay_ms(500);
+                    }
+                    
+                    // Wait for card to be removed before allowing next read
+                    WaitForCardRemoval();
+                    cardPresent = 0;
+                    delay_ms(300); // Additional debounce delay
+                }
+            }
+        }
+
+        // ========== SAFETY & EMERGENCY MONITORING ==========
+        mq_adc = read_mq135();
+        uint8_t workers = getInsideCount();
+
+        if(workers > 0 &&
+           (mq_adc > AIR_DANGER ||
+            temperature > TEMP_DANGER ||
+            humidity > HUM_DANGER))
+        {
+            if(!alarm_active) {
+                alarm_active = 1;
+                admin_notified = 0;
+                LPC_GPIO1->FIOSET = BUZZER_PIN;
+            }
+
+            if(!admin_notified) {
+                admin_notified = 1;
+                SendAlertJSON("EMERGENCY", mq_adc);
+            }
+        }
+        else
+        {
+            if(alarm_active && mq_adc < AIR_SAFE) {
+                alarm_active = 0;
+                admin_notified = 0;
+                LPC_GPIO1->FIOCLR = BUZZER_PIN;
+                SendAlertJSON("CLEARED", mq_adc);
+            }
+        }
+
+        delay_ms(50);
+    }
+}
